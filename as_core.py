@@ -49,7 +49,7 @@ RANGE_ALL = 'Whole extent of the objects'
 RANGES = [RANGE_SHARED, RANGE_ALL]
 
 DEFAULTS = {'r_mm': 3.0, 'planes': 12, 'bottom_mm': 0.0, 'top_mm': 0.0,
-            'range': RANGE_SHARED, 'join': True,
+            'range': RANGE_SHARED, 'join': False,
             'bridge': True, 'preview': True, 'hide_inputs': False}
 CONTOUR_COLOUR = (40, 140, 230)
 END_EPS_MM = 0.02          # a plane exactly on an end cap cuts a face, not a solid
@@ -549,7 +549,7 @@ def describe(fr, res, o):
             % (len(secs), fr['length_mm'], res.get('points', 0))]
     if fr.get('outside_mm', 0) > 0.05:
         rows.append('%.1f mm of the objects lies outside the lofted range%s'
-                    % (fr['outside_mm'], ' (joined back in)' if o.get('join', True) else ''))
+                    % (fr['outside_mm'], ' (joined back in)' if o.get('join', False) else ''))
     if areas:
         rows.append('section area %.1f - %.1f mm2' % (min(areas), max(areas)))
     for w in res.get('warnings', []):
@@ -593,15 +593,15 @@ def on_created(app, cmd):
     for label in RANGES:
         dd.listItems.add(label, label == o.get('range', RANGE_SHARED))
     dd.tooltip = ('Where the planes go. "%s": only the stretch every object crosses, '
-                  'which keeps the sections alike; with "Join" on, the parts that stick '
-                  'out still end up in the result. "%s": end to end.'
+                  'which keeps the sections alike; the parts that stick out stay outside '
+                  'the loft unless "Join" is on. "%s": end to end.'
                   % (RANGE_SHARED, RANGE_ALL))
     inputs.addFloatSpinnerCommandInput('bottom', 'Bottom offset', 'mm', 0.0, 1000.0, 0.5,
                                        o['bottom_mm'] * MM)
     inputs.addFloatSpinnerCommandInput('top', 'Top offset', 'mm', 0.0, 1000.0, 0.5,
                                        o['top_mm'] * MM)
     v = inputs.addBoolValueInput('join', 'Join the objects to the loft', True, '',
-                                 bool(o.get('join', True)))
+                                 bool(o.get('join', False)))
     v.tooltip = ('Join the loft with the selected solids (which are kept), so the parts '
                  'outside the lofted range are part of one body.')
     v = inputs.addBoolValueInput('bridge', 'Bridge planes that fall apart', True, '',
@@ -678,7 +678,7 @@ def on_execute(app, ui, inputs):
                              'Raise the closing radius to at least %.2f mm.'
                              % (o['r_mm'], res['r_needed_mm']))
         body = build_loft(app, fr, res, o)
-        if o.get('join', True):
+        if o.get('join', False):
             join_objects(app, body, bodies)
     except (ValueError, RuntimeError) as exc:
         ui.messageBox(str(exc), CMD_NAME)
@@ -778,7 +778,7 @@ def dev_run(app, job):
     out['bridged'] = res.get('bridged')
     if job.get('create') and not res.get('r_needed_mm'):
         body = build_loft(app, fr, res, o)
-        if o.get('join', True):
+        if o.get('join', False):
             out['joined'] = join_objects(app, body, bodies)
         out.update({'body': body.name, 'solid': body.isSolid, 'faces': body.faces.count,
                     'volume_mm3': round(body.volume * 1000.0, 2)})

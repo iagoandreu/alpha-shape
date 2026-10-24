@@ -15,7 +15,7 @@ by a loft.
 | Planes | number of sections |
 | Range | **Where every object is cut** (default) or **Whole extent of the objects** |
 | Bottom / Top offset | shorten the range at either end |
-| Join the objects to the loft | join the selected solids (kept) to the loft, so what sticks out of the range is part of one body (on) |
+| Join the objects to the loft | off (default): the result is just the loft of the sections. On: the selected solids (kept) are joined to it, so what sticks out of the range is part of one body |
 | Bridge planes that fall apart | see below (on) |
 | Preview | the section contours and their matching lines, live |
 
