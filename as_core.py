@@ -1,16 +1,19 @@
 """Alpha Shape - the work. Re-imported on every command event and dev job.
 
-Wraps the selected bodies (solid, surface or mesh) in their alpha shape: the
-surfaces are sampled every `resolution` mm, a 3D Delaunay is built once, and the
-tetrahedra whose circumscribed ball is no larger than `alpha` make the solid; its
-boundary becomes a mesh body. A small alpha hugs each object, a large one tends
-to the convex hull of the lot. The maths runs in as_engine.py, in a Python with
-numpy and scipy, because Fusion's own has neither.
+Wraps the selected bodies in a LOFTED SOLID, not a mesh:
+  1. a direction - picked (planar face, plane, axis, edge, cylinder) or, by
+     default, the mean axis of the cylinders among the bodies;
+  2. N planes across the bodies' extent along it (minus optional end offsets);
+  3. each plane cuts every body exactly (TemporaryBRepManager.planeIntersection;
+     mesh bodies are sliced in the engine);
+  4. in each plane the cuts are united and closed with a disk of radius r
+     (dilate r, erode r): gaps narrower than 2r fill with round arcs of radius
+     r, and the outer contour is kept - as_engine.py, numpy + shapely;
+  5. the contours, resampled with matching points, become closed splines and a
+     solid loft joins them.
 
-The preview follows the dialog: the tessellation is cached per selection and the
-Delaunay per resolution (on disk), so moving alpha only re-filters.
-
-All geometry crossing into Fusion is in centimetres; the engine works in mm.
+The preview draws the contours. All geometry crossing into Fusion is in cm; the
+engine works in mm in each plane's own (u, v).
 """
 
 import adsk.core
@@ -18,6 +21,7 @@ import adsk.fusion
 
 import hashlib
 import json
+import math
 import os
 import subprocess
 import sys
@@ -28,7 +32,7 @@ import types
 
 ADDIN_DIR = os.path.dirname(os.path.realpath(__file__))
 ENGINE = os.path.join(ADDIN_DIR, 'as_engine.py')
-CACHE_DIR = os.path.join(tempfile.gettempdir(), 'alpha_shape_cache')
+WORK_DIR = os.path.join(tempfile.gettempdir(), 'alpha_shape_work')
 SETTINGS_PATH = os.path.join(ADDIN_DIR, 'last_settings.json')
 LOG_PATH = os.path.join(ADDIN_DIR, 'AlphaShape.log')
 RES_DIR = os.path.join(ADDIN_DIR, 'resources', 'AlphaShape')
@@ -38,11 +42,17 @@ NO_WINDOW = 0x08000000 if os.name == 'nt' else 0
 
 CMD_ID = 'AlphaShape_Create'
 CMD_NAME = 'Alpha Shape'
-PANELS = ['ParaMeshCreatePanel', 'SolidCreatePanel']
+PANELS = ['SolidCreatePanel', 'ParaMeshCreatePanel']
 
-DEFAULTS = {'alpha_mm': 3.0, 'resolution_mm': 0.5, 'preview': True,
-            'regular': True, 'drop_small': True, 'hide_inputs': False}
-PREVIEW_COLOUR = (64, 160, 220)
+RANGE_SHARED = 'Where every object is cut'
+RANGE_ALL = 'Whole extent of the objects'
+RANGES = [RANGE_SHARED, RANGE_ALL]
+
+DEFAULTS = {'r_mm': 3.0, 'planes': 12, 'bottom_mm': 0.0, 'top_mm': 0.0,
+            'range': RANGE_SHARED, 'join': True,
+            'bridge': True, 'preview': True, 'hide_inputs': False}
+CONTOUR_COLOUR = (40, 140, 230)
+END_EPS_MM = 0.02          # a plane exactly on an end cap cuts a face, not a solid
 
 
 def log(msg):
@@ -63,9 +73,8 @@ def state():
     if st is None:
         st = types.ModuleType('_as_state')
         st.python = None
-        st.tess = {}          # selection key -> (coords mm, idx)
-        st.caches = {}        # (selection key, resolution) -> npz path
-        st.last = None        # (selection key, resolution, alpha, options) -> result
+        st.cuts = {}
+        st.last = None
         st.report = ''
         sys.modules['_as_state'] = st
     return st
@@ -75,7 +84,7 @@ def load_settings():
     o = dict(DEFAULTS)
     try:
         with open(SETTINGS_PATH, encoding='utf-8') as fh:
-            o.update(json.load(fh))
+            o.update({k: v for k, v in json.load(fh).items() if k in DEFAULTS})
     except Exception:
         pass
     return o
@@ -94,11 +103,36 @@ def is_parametric(design):
 
 
 # --------------------------------------------------------------------------- #
+# small vector helpers (Fusion's Python has no numpy)
+# --------------------------------------------------------------------------- #
+
+def _sub(a, b):
+    return (a[0] - b[0], a[1] - b[1], a[2] - b[2])
+
+
+def _dot(a, b):
+    return a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+
+
+def _cross(a, b):
+    return (a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0])
+
+
+def _unit(a):
+    n = math.sqrt(_dot(a, a))
+    return (a[0] / n, a[1] / n, a[2] / n) if n > 0 else a
+
+
+def _tup(p):
+    return (p.x, p.y, p.z)
+
+
+# --------------------------------------------------------------------------- #
 # the engine
 # --------------------------------------------------------------------------- #
 
 def python_cmd():
-    """An interpreter with numpy and scipy: ALPHASHAPE_PYTHON, python_path.txt
+    """An interpreter with numpy and shapely: ALPHASHAPE_PYTHON, python_path.txt
     beside the add-in, the usual install folders, then py -3.10."""
     st = state()
     if st.python:
@@ -119,21 +153,22 @@ def python_cmd():
     cands.append(['py', '-3.10'])
     for c in cands:
         try:
-            r = subprocess.run(c + ['-c', 'import numpy, scipy'], capture_output=True,
+            r = subprocess.run(c + ['-c', 'import numpy, shapely'], capture_output=True,
                                timeout=60, creationflags=NO_WINDOW)
             if r.returncode == 0:
                 st.python = c
                 return c
         except Exception:
             pass
-    raise RuntimeError('No Python with numpy and scipy was found. Set ALPHASHAPE_PYTHON '
-                       'or put the interpreter path in python_path.txt beside the add-in.')
+    raise RuntimeError('No Python with numpy and shapely was found (pip install shapely). '
+                       'Set ALPHASHAPE_PYTHON or put the interpreter path in '
+                       'python_path.txt beside the add-in.')
 
 
-def run_engine(job, timeout=900):
-    os.makedirs(CACHE_DIR, exist_ok=True)
-    jp = os.path.join(CACHE_DIR, 'job.json')
-    op = os.path.join(CACHE_DIR, 'out.json')
+def run_engine(job, timeout=600):
+    os.makedirs(WORK_DIR, exist_ok=True)
+    jp = os.path.join(WORK_DIR, 'job.json')
+    op = os.path.join(WORK_DIR, 'out.json')
     with open(jp, 'w', encoding='utf-8') as fh:
         json.dump(job, fh)
     if os.path.exists(op):
@@ -141,95 +176,265 @@ def run_engine(job, timeout=900):
     r = subprocess.run(python_cmd() + [ENGINE, jp, op], capture_output=True, text=True,
                        timeout=timeout, creationflags=NO_WINDOW)
     if not os.path.exists(op):
-        raise RuntimeError('the alpha-shape engine produced nothing:\n%s' % r.stderr[-800:])
+        raise RuntimeError('the section engine produced nothing:\n%s' % r.stderr[-800:])
     with open(op, encoding='utf-8') as fh:
         res = json.load(fh)
     if not res.get('ok'):
-        raise RuntimeError('the alpha-shape engine failed:\n%s' % res.get('error', '')[-800:])
+        err = res.get('error', '')
+        raise RuntimeError(short_error(err) if 'ValueError' in err else
+                           'the section engine failed:\n%s' % err[-800:])
     return res
 
 
 # --------------------------------------------------------------------------- #
-# the input bodies
+# direction and range
 # --------------------------------------------------------------------------- #
 
-def selected_bodies(sel):
+def selected(sel):
     return [sel.selection(i).entity for i in range(sel.selectionCount)]
 
 
-def body_key(bodies, res_mm):
-    toks = []
-    for b in bodies:
-        try:
-            toks.append(b.entityToken)
-        except Exception:
-            toks.append(b.name)
-    return hashlib.sha1(('|'.join(sorted(toks)) + '@%.4f' % res_mm).encode()).hexdigest()[:16]
+def direction_of(entity):
+    """A unit direction from a picked plane, face, axis or edge; None if unusable."""
+    for cast, get in (
+            (adsk.fusion.ConstructionPlane, lambda e: e.geometry.normal),
+            (adsk.fusion.ConstructionAxis, lambda e: e.geometry.direction),
+            (adsk.fusion.SketchLine, lambda e: _sub(_tup(e.worldGeometry.endPoint),
+                                                    _tup(e.worldGeometry.startPoint)))):
+        e = cast.cast(entity)
+        if e:
+            g = get(e)
+            return _unit(g if isinstance(g, tuple) else _tup(g))
+    f = adsk.fusion.BRepFace.cast(entity)
+    if f:
+        g = f.geometry
+        pl = adsk.core.Plane.cast(g)
+        if pl:
+            return _unit(_tup(pl.normal))
+        cy = adsk.core.Cylinder.cast(g)
+        if cy:
+            return _unit(_tup(cy.axis))
+        cn = adsk.core.Cone.cast(g)
+        if cn:
+            return _unit(_tup(cn.axis))
+    e = adsk.fusion.BRepEdge.cast(entity)
+    if e:
+        ln = adsk.core.Line3D.cast(e.geometry)
+        if ln:
+            return _unit(_sub(_tup(ln.endPoint), _tup(ln.startPoint)))
+    return None
 
 
-def body_triangles(b, res_mm):
-    """World triangles of a body, in mm."""
+def body_points(b):
+    """A cloud of points on a body, cm: the nodes of a coarse (0.1 mm) tessellation."""
     mb = adsk.fusion.MeshBody.cast(b)
     if mb:
-        pm = mb.mesh
-        if pm and pm.triangleCount and not pm.quadCount and not pm.polygonCount:
-            c, i = pm.nodeCoordinatesAsDouble, pm.triangleNodeIndices
-        else:
-            dm = mb.displayMesh
-            c, i = dm.nodeCoordinatesAsDouble, dm.nodeIndices
-        return [v * CM for v in c], list(i)
-    bb = adsk.fusion.BRepBody.cast(b)
-    calc = bb.meshManager.createMeshCalculator()
-    # a tenth of the sampling step, but never finer than 0.05 mm: 0.01 mm on a
-    # 30 mm ball once took Fusion down
-    calc.surfaceTolerance = max(0.005, min(0.1, 0.1 * res_mm * MM))
-    m = calc.calculate()
-    return [v * CM for v in m.nodeCoordinatesAsDouble], list(m.nodeIndices)
-
-
-def tessellate(bodies, res_mm):
-    st = state()
-    key = body_key(bodies, res_mm)
-    if key not in st.tess:
-        coords, idx = [], []
-        for b in bodies:
-            c, i = body_triangles(b, res_mm)
-            base = len(coords) // 3
-            coords.extend(c)
-            idx.extend(base + k for k in i)
-        st.tess = {key: (coords, idx)}          # one selection at a time
-    return key, st.tess[key]
-
-
-def compute(bodies, o):
-    """Alpha shape of the bodies; cached at every level that can be."""
-    st = state()
-    res_mm, alpha_mm = float(o['resolution_mm']), float(o['alpha_mm'])
-    key, (coords, idx) = tessellate(bodies, res_mm)
-    sig = (key, res_mm, alpha_mm, bool(o['regular']), bool(o['drop_small']))
-    if st.last and st.last[0] == sig:
-        return st.last[1]
-    job = {'alpha_mm': alpha_mm, 'regular': bool(o['regular']),
-           'min_piece': 0.01 if o['drop_small'] else 0.0}
-    cache = st.caches.get((key, res_mm))
-    if cache and os.path.exists(cache):
-        job['cache'] = cache
+        c = mb.displayMesh.nodeCoordinatesAsDouble
     else:
-        job.update({'coords': coords, 'idx': idx, 'resolution_mm': res_mm,
-                    'cache_dir': CACHE_DIR})
+        # not displayMeshes.bestMesh: a body that has not been drawn yet (hidden,
+        # or its document just activated) has none and it raises "count > 0"
+        calc = adsk.fusion.BRepBody.cast(b).meshManager.createMeshCalculator()
+        calc.surfaceTolerance = 0.01
+        c = calc.calculate().nodeCoordinatesAsDouble
+    return [(c[i], c[i + 1], c[i + 2]) for i in range(0, len(c), 3)]
+
+
+def auto_direction(bodies, pts):
+    """Mean axis of the cylindrical faces, weighted by area and sign-aligned; with
+    none, the principal axis of the points."""
+    acc, ref = [0.0, 0.0, 0.0], None
+    for b in bodies:
+        bb = adsk.fusion.BRepBody.cast(b)
+        if not bb:
+            continue
+        for f in bb.faces:
+            cy = adsk.core.Cylinder.cast(f.geometry)
+            if not cy:
+                continue
+            a = _unit(_tup(cy.axis))
+            if ref is None:
+                ref = a
+            s = 1.0 if _dot(a, ref) >= 0 else -1.0
+            for k in range(3):
+                acc[k] += s * f.area * a[k]
+    if ref is not None and _dot(acc, acc) > 0:
+        return _unit(tuple(acc)), 'mean axis of the cylinders'
+    # principal axis by power iteration on the covariance
+    n = float(len(pts))
+    c = tuple(sum(p[k] for p in pts) / n for k in range(3))
+    C = [[sum((p[i] - c[i]) * (p[j] - c[j]) for p in pts) / n for j in range(3)] for i in range(3)]
+    v = (1.0, 0.7, 0.3)
+    for _ in range(100):
+        v = _unit(tuple(sum(C[i][j] * v[j] for j in range(3)) for i in range(3)))
+    return v, 'principal axis of the bodies'
+
+
+def frame(d):
+    h = (1.0, 0.0, 0.0) if abs(d[0]) < 0.9 else (0.0, 1.0, 0.0)
+    e1 = _unit(_cross(d, h))
+    return e1, _cross(d, e1)
+
+
+# --------------------------------------------------------------------------- #
+# the cuts
+# --------------------------------------------------------------------------- #
+
+def _chain(polylines, tol=1e-4):
+    """Join open polylines end to end into closed loops (cm)."""
+    loops, open_ = [], [list(p) for p in polylines if len(p) >= 2]
+    d = lambda a, b: math.sqrt(_dot(_sub(a, b), _sub(a, b)))
+    while open_:
+        cur = open_.pop(0)
+        grown = True
+        while grown and d(cur[0], cur[-1]) > tol:
+            grown = False
+            for i, p in enumerate(open_):
+                for rev in (False, True):
+                    q = p[::-1] if rev else p
+                    if d(cur[-1], q[0]) <= tol:
+                        cur.extend(q[1:])
+                        open_.pop(i)
+                        grown = True
+                        break
+                if grown:
+                    break
+        if d(cur[0], cur[-1]) <= tol and len(cur) >= 4:
+            loops.append(cur[:-1])
+    return loops
+
+
+def plane_cuts(body, origin, d, e1, e2, heights_mm, tol_cm=0.001):
+    """Closed cut loops of a BRep body at each height, as (u, v) mm.
+
+    Only planes inside the body's own extent are asked for: a plane that misses
+    RAISES (InternalValidationError : result), and the error then stays pending
+    and surfaces on the next API call - TemporaryBRepManager.get() included."""
+    tbm = adsk.fusion.TemporaryBRepManager.get()
+    hs = [_dot(_sub(p, origin), d) * CM for p in body_points(body)]
+    lo, hi = min(hs) + END_EPS_MM, max(hs) - END_EPS_MM
+    out = []
+    for h in heights_mm:
+        if not lo <= h <= hi:
+            out.append([])
+            continue
+        o = tuple(origin[k] + h * MM * d[k] for k in range(3))
+        wire = tbm.planeIntersection(body, adsk.core.Plane.create(
+            adsk.core.Point3D.create(*o), adsk.core.Vector3D.create(*d)))
+        polys = []
+        if wire:
+            for e in wire.edges:
+                ev = e.evaluator
+                ok, p0, p1 = ev.getParameterExtents()
+                ok, pts = ev.getStrokes(p0, p1, tol_cm)
+                polys.append([_tup(p) for p in pts])
+        loops = []
+        for lp in _chain(polys):
+            loops.append([[_dot(_sub(p, origin), e1) * CM, _dot(_sub(p, origin), e2) * CM]
+                          for p in lp])
+        out.append(loops)
+    return out
+
+
+def setup(bodies, dir_entity, o):
+    """Direction, frame, range and the planes' heights (mm from the origin)."""
+    pts = [p for b in bodies for p in body_points(b)]
+    d, why = None, ''
+    if dir_entity is not None:
+        d = direction_of(dir_entity)
+        why = 'picked'
+        if d is None:
+            raise ValueError('that selection gives no direction; pick a planar face, '
+                             'a plane, an axis, a straight edge or a cylinder')
+    if d is None:
+        d, why = auto_direction(bodies, pts)
+    e1, e2 = frame(d)
+    n = float(len(pts))
+    origin = tuple(sum(p[k] for p in pts) / n for k in range(3))
+    # Where every object is cut, by default. Over the whole extent, objects that
+    # end at different heights leave planes cutting only some of them, far
+    # apart: on the Dlab_155 margins the AK pins run 13-20 mm past the screw
+    # margins, those planes needed 36 mm bridges and the loft creased, or failed
+    # outright with 32 planes. Over the shared range the bridges were 3.5-6 mm and
+    # 12 and 24 planes gave the same volume within 0.5 %.
+    ext = []
+    for b in bodies:
+        hb = [_dot(_sub(p, origin), d) * CM for p in body_points(b)]
+        ext.append((min(hb), max(hb)))
+    if o.get('range', RANGE_SHARED) == RANGE_SHARED:
+        lo0, hi0 = max(e[0] for e in ext), min(e[1] for e in ext)
+        if hi0 <= lo0:
+            raise ValueError('no stretch of the direction cuts every object; choose '
+                             '"%s"' % RANGE_ALL)
+    else:
+        lo0, hi0 = min(e[0] for e in ext), max(e[1] for e in ext)
+    lo = lo0 + float(o['bottom_mm']) + END_EPS_MM
+    hi = hi0 - float(o['top_mm']) - END_EPS_MM
+    if hi <= lo:
+        raise ValueError('the end offsets leave no length between the planes')
+    N = max(2, int(o['planes']))
+    heights = [lo + (hi - lo) * k / (N - 1) for k in range(N)]
+    return {'d': d, 'why': why, 'e1': e1, 'e2': e2, 'origin': origin,
+            'heights': heights, 'length_mm': hi - lo,
+            'outside_mm': max(0.0, lo0 - min(e[0] for e in ext)) +
+            max(0.0, max(e[1] for e in ext) - hi0)}
+
+
+def sections(bodies, dir_entity, o):
+    st = state()
+    toks = sorted(getattr(b, 'entityToken', b.name) for b in bodies)
+    dtok = getattr(dir_entity, 'entityToken', '') if dir_entity is not None else ''
+    fr = setup(bodies, dir_entity, o)
+    key = hashlib.sha1(('|'.join(toks) + dtok + repr(fr['heights']) + repr(fr['d'])
+                        ).encode()).hexdigest()
+    if key not in st.cuts:
+        loops = [[] for _ in fr['heights']]
+        meshes = []
+        for b in bodies:
+            bb = adsk.fusion.BRepBody.cast(b)
+            if bb:
+                for k, lp in enumerate(plane_cuts(bb, fr['origin'], fr['d'], fr['e1'],
+                                                  fr['e2'], fr['heights'])):
+                    loops[k].extend(lp)
+            else:
+                dm = adsk.fusion.MeshBody.cast(b).displayMesh
+                meshes.append({'coords': [v * CM for v in dm.nodeCoordinatesAsDouble],
+                               'idx': list(dm.nodeIndices),
+                               'origin': [v * CM for v in fr['origin']],
+                               'e1': list(fr['e1']), 'e2': list(fr['e2']), 'd': list(fr['d'])})
+        st.cuts = {key: (loops, meshes)}
+    loops, meshes = st.cuts[key]
+    return fr, loops, meshes
+
+
+def compute(bodies, dir_entity, o):
+    st = state()
     t0 = time.time()
-    res = run_engine(job)
+    fr, loops, meshes = sections(bodies, dir_entity, o)
+    # the engine's own date too: an edited engine must not be answered from cache
+    sig = (id(loops), float(o['r_mm']), bool(o.get('bridge', True)),
+           os.path.getmtime(ENGINE))
+    if st.last and st.last[0] == sig:
+        return fr, st.last[1]
+    res = run_engine({'r_mm': float(o['r_mm']), 'spacing_mm': 0.75, 'max_points': 160,
+                      'bridge': bool(o.get('bridge', True)),
+                      'sections': [{'h': h, 'loops': lp} for h, lp in zip(fr['heights'], loops)],
+                      'meshes': meshes})
     res['wall_s'] = round(time.time() - t0, 2)
-    st.caches[(key, res_mm)] = res['cache']
     st.last = (sig, res)
-    return res
+    return fr, res
+
+
+def to_world(fr, h, uv):
+    o, d, e1, e2 = fr['origin'], fr['d'], fr['e1'], fr['e2']
+    return [tuple(o[k] + (h * d[k] + u * e1[k] + v * e2[k]) * MM for k in range(3))
+            for u, v in uv]
 
 
 # --------------------------------------------------------------------------- #
 # preview graphics
 # --------------------------------------------------------------------------- #
 
-GROUP_ATTR = 'AlphaShapePreview'
+GROUP_ID = 'AlphaShapePreview'
 
 
 def clear_graphics(app):
@@ -239,57 +444,117 @@ def clear_graphics(app):
             return
         cg = des.rootComponent.customGraphicsGroups
         for i in range(cg.count - 1, -1, -1):
-            g = cg.item(i)
-            if g.id == GROUP_ATTR:
-                g.deleteMe()
+            if cg.item(i).id == GROUP_ID:
+                cg.item(i).deleteMe()
     except Exception:
         pass
 
 
-def draw(app, res):
+def draw(app, fr, res):
     clear_graphics(app)
-    if not res.get('tris'):
+    secs = res.get('sections') or []
+    if not secs:
         return
     des = adsk.fusion.Design.cast(app.activeProduct)
     g = des.rootComponent.customGraphicsGroups.add()
-    g.id = GROUP_ATTR
-    coords = adsk.fusion.CustomGraphicsCoordinates.create([v * MM for v in res['coords']])
-    # per-vertex normals: without them the shell renders flat and the long
-    # triangles an alpha shape spans between objects are hard to read
-    nrm = res.get('normals') or []
-    mesh = g.addMesh(coords, res['idx'], nrm, res['idx'] if nrm else [])
-    c = PREVIEW_COLOUR
-    mesh.color = adsk.fusion.CustomGraphicsBasicMaterialColorEffect.create(
-        adsk.core.Color.create(c[0], c[1], c[2], 255), None, None, None, 5.0, 0.55)
-    try:
-        mesh.isSelectable = False
-    except Exception:
-        pass
+    g.id = GROUP_ID
+    coords, idx = [], []
+    for s in secs:
+        base = len(coords) // 3
+        pts = to_world(fr, s['h'], s['uv'])
+        for p in pts:
+            coords.extend(p)
+        n = len(pts)
+        for i in range(n):
+            idx.extend([base + i, base + (i + 1) % n])
+    # the matching points, joined along the stack: the loft's own lines
+    n = len(secs[0]['uv'])
+    for j in range(0, n, max(1, n // 12)):
+        for k in range(len(secs) - 1):
+            idx.extend([k * n + j, (k + 1) * n + j])
+    lines = g.addLines(adsk.fusion.CustomGraphicsCoordinates.create(coords), idx, False)
+    c = CONTOUR_COLOUR
+    lines.color = adsk.fusion.CustomGraphicsSolidColorEffect.create(
+        adsk.core.Color.create(c[0], c[1], c[2], 255))
+    lines.weight = 2.0
+    lines.depthPriority = 1
     app.activeViewport.refresh()
+
+
+# --------------------------------------------------------------------------- #
+# the solid
+# --------------------------------------------------------------------------- #
+
+def build_loft(app, fr, res, o):
+    des = adsk.fusion.Design.cast(app.activeProduct)
+    comp = des.rootComponent
+    sk = comp.sketches.add(comp.xYConstructionPlane)
+    sk.name = 'Alpha shape sections'
+    sk.isComputeDeferred = True
+    splines = []
+    for s in res['sections']:
+        coll = adsk.core.ObjectCollection.create()
+        for p in to_world(fr, s['h'], s['uv']):
+            coll.add(sk.modelToSketchSpace(adsk.core.Point3D.create(*p)))
+        spl = sk.sketchCurves.sketchFittedSplines.add(coll)
+        spl.isClosed = True
+        splines.append(spl)
+    sk.isComputeDeferred = False
+    sk.isVisible = False
+    lin = comp.features.loftFeatures.createInput(
+        adsk.fusion.FeatureOperations.NewBodyFeatureOperation)
+    lin.isSolid = True
+    for spl in splines:
+        lin.loftSections.add(comp.features.createPath(spl, False))
+    try:
+        loft = comp.features.loftFeatures.add(lin)
+    except Exception:
+        sk.deleteMe()
+        raise RuntimeError('the loft refused these sections: %s'
+                           % short_error(traceback.format_exc()))
+    loft.name = 'Alpha shape loft'
+    body = loft.bodies.item(0)
+    body.name = 'Alpha shape r%.2f n%d' % (float(o['r_mm']), len(splines))
+    return body
+
+
+def join_objects(app, body, bodies):
+    """Join the loft with the selected solids, keeping them: the parts outside
+    the lofted range become part of one body."""
+    comp = body.parentComponent
+    tools = adsk.core.ObjectCollection.create()
+    for b in bodies:
+        bb = adsk.fusion.BRepBody.cast(b)
+        if bb and bb.isSolid:
+            tools.add(bb)
+    if not tools.count:
+        return 0
+    ci = comp.features.combineFeatures.createInput(body, tools)
+    ci.operation = adsk.fusion.FeatureOperations.JoinFeatureOperation
+    ci.isKeepToolBodies = True
+    f = comp.features.combineFeatures.add(ci)
+    f.name = 'Alpha shape join'
+    return tools.count
 
 
 # --------------------------------------------------------------------------- #
 # report
 # --------------------------------------------------------------------------- #
 
-def describe(res, o):
-    if not res.get('tris'):
-        return ('<b>Nothing at alpha %.3f mm.</b> The smallest ball through the samples '
-                'has radius %.3f mm: raise alpha above it, or refine the resolution.'
-                % (o['alpha_mm'], res.get('r_min_mm', 0)))
-    rows = [
-        '%d sample points, %d tetrahedra kept, %d triangles'
-        % (res['points'], res['tets'], res['tris']),
-        'volume %.1f mm3, area %.1f mm2, %d piece(s)'
-        % (res['volume_mm3'], res['area_mm2'], res['pieces']),
-        ('<b>watertight</b>' if res['watertight'] else
-         '<b>NOT watertight</b>: %d non-manifold spot(s), %d open edge(s)'
-         % (res['nonmanifold_edges'], res['open_edges'])),
-        '%.1f s' % res.get('wall_s', res.get('secs', 0)),
-    ]
-    for l in res.get('log', []):
-        if l.startswith('regularised'):
-            rows.append(l)
+def describe(fr, res, o):
+    secs = res.get('sections') or []
+    areas = [s['area_mm2'] for s in secs]
+    rows = ['direction: %s (%.3f, %.3f, %.3f)' % ((fr['why'],) + tuple(fr['d'])),
+            '%d sections over %.2f mm, %d matching points each'
+            % (len(secs), fr['length_mm'], res.get('points', 0))]
+    if fr.get('outside_mm', 0) > 0.05:
+        rows.append('%.1f mm of the objects lies outside the lofted range%s'
+                    % (fr['outside_mm'], ' (joined back in)' if o.get('join', True) else ''))
+    if areas:
+        rows.append('section area %.1f - %.1f mm2' % (min(areas), max(areas)))
+    for w in res.get('warnings', []):
+        rows.append('<b>%s</b>' % w)
+    rows.append('%.1f s' % res.get('wall_s', 0))
     return '<br>'.join(rows)
 
 
@@ -300,7 +565,7 @@ def describe(res, o):
 def on_created(app, cmd):
     o = load_settings()
     inputs = cmd.commandInputs
-    cmd.setDialogInitialSize(360, 380)
+    cmd.setDialogInitialSize(360, 420)
     cmd.okButtonText = 'Create'
     cmd.isExecutedWhenPreEmpted = False
     sel = inputs.addSelectionInput('bodies', 'Bodies', 'The objects to wrap')
@@ -308,40 +573,65 @@ def on_created(app, cmd):
     sel.addSelectionFilter('SurfaceBodies')
     sel.addSelectionFilter('MeshBodies')
     sel.setSelectionLimits(1, 0)
-    a = inputs.addFloatSpinnerCommandInput('alpha', 'Alpha (ball radius)', 'mm',
-                                           0.001, 1000.0, 0.5, o['alpha_mm'] * MM)
-    a.tooltip = ('The radius of the probe ball. Space narrower than this between the '
-                 'objects is filled; a small alpha hugs each object, a large one tends '
-                 'to the convex hull of them all. Below an object\'s own radius it '
-                 'falls apart into shreds.')
-    r = inputs.addFloatSpinnerCommandInput('resolution', 'Resolution', 'mm',
-                                           0.002, 2.0, 0.1, o['resolution_mm'] * MM)
-    r.tooltip = ('Sampling step on the surfaces. Finer follows the objects more '
-                 'closely and takes longer (a new resolution rebuilds the Delaunay; '
-                 'a new alpha does not). Keep alpha well above it.')
+    ds = inputs.addSelectionInput('direction', 'Direction',
+                                  'Optional: a planar face or plane (its normal), an axis, '
+                                  'a straight edge or a cylinder')
+    for f in ('PlanarFaces', 'CylindricalFaces', 'ConstructionPlanes', 'ConstructionLines',
+              'LinearEdges', 'SketchLines'):
+        ds.addSelectionFilter(f)
+    ds.setSelectionLimits(0, 1)
+    ds.tooltip = ('The sections are perpendicular to this. Leave it empty to use the mean '
+                  'axis of the cylinders among the bodies.')
+    # capped: above ~300 mm GEOS loses precision on millimetre objects
+    v = inputs.addFloatSpinnerCommandInput('r', 'Closing radius', 'mm', 0.0, 20.0, 0.5,
+                                           o['r_mm'] * MM)
+    v.tooltip = ('In every section, gaps between the objects narrower than twice this are '
+                 'filled, with round arcs of this radius. 0 just unites the cuts.')
+    inputs.addIntegerSpinnerCommandInput('planes', 'Planes', 2, 400, 1, int(o['planes']))
+    dd = inputs.addDropDownCommandInput('range', 'Range',
+                                        adsk.core.DropDownStyles.TextListDropDownStyle)
+    for label in RANGES:
+        dd.listItems.add(label, label == o.get('range', RANGE_SHARED))
+    dd.tooltip = ('Where the planes go. "%s": only the stretch every object crosses, '
+                  'which keeps the sections alike; with "Join" on, the parts that stick '
+                  'out still end up in the result. "%s": end to end.'
+                  % (RANGE_SHARED, RANGE_ALL))
+    inputs.addFloatSpinnerCommandInput('bottom', 'Bottom offset', 'mm', 0.0, 1000.0, 0.5,
+                                       o['bottom_mm'] * MM)
+    inputs.addFloatSpinnerCommandInput('top', 'Top offset', 'mm', 0.0, 1000.0, 0.5,
+                                       o['top_mm'] * MM)
+    v = inputs.addBoolValueInput('join', 'Join the objects to the loft', True, '',
+                                 bool(o.get('join', True)))
+    v.tooltip = ('Join the loft with the selected solids (which are kept), so the parts '
+                 'outside the lofted range are part of one body.')
+    v = inputs.addBoolValueInput('bridge', 'Bridge planes that fall apart', True, '',
+                                 bool(o.get('bridge', True)))
+    v.tooltip = ('Where objects end at different heights, a plane can cut only some of '
+                 'them, too far apart for the closing radius to join. On: that plane alone '
+                 'gets the radius that joins it (the report lists them). Off: Create '
+                 'refuses and says which radius would join every plane.')
     inputs.addBoolValueInput('preview', 'Preview', True, '', bool(o['preview']))
-    adv = inputs.addGroupCommandInput('advanced', 'Options')
-    adv.isExpanded = False
-    ch = adv.children
-    v = ch.addBoolValueInput('regular', 'Repair non-manifold spots', True, '',
-                             bool(o['regular']))
-    v.tooltip = ('Where two parts of the shape touch only along an edge or at a point, '
-                 'remove the tetrahedra there, so the result is a closed manifold.')
-    v = ch.addBoolValueInput('drop_small', 'Drop pieces under 1 % of the volume', True,
-                             '', bool(o['drop_small']))
-    ch.addBoolValueInput('hide_inputs', 'Hide the selected bodies afterwards', True, '',
-                         bool(o['hide_inputs']))
+    inputs.addBoolValueInput('hide_inputs', 'Hide the selected bodies afterwards', True, '',
+                             bool(o['hide_inputs']))
     inputs.addTextBoxCommandInput('info', '', state().report or
-                                  'Select the bodies to wrap.', 6, True)
+                                  'Select the bodies to wrap.', 7, True)
 
 
 def read_options(inputs):
-    return {'alpha_mm': inputs.itemById('alpha').value * CM,
-            'resolution_mm': inputs.itemById('resolution').value * CM,
+    return {'r_mm': inputs.itemById('r').value * CM,
+            'planes': inputs.itemById('planes').value,
+            'bottom_mm': inputs.itemById('bottom').value * CM,
+            'top_mm': inputs.itemById('top').value * CM,
+            'bridge': inputs.itemById('bridge').value,
+            'range': inputs.itemById('range').selectedItem.name,
+            'join': inputs.itemById('join').value,
             'preview': inputs.itemById('preview').value,
-            'regular': inputs.itemById('regular').value,
-            'drop_small': inputs.itemById('drop_small').value,
             'hide_inputs': inputs.itemById('hide_inputs').value}
+
+
+def _dir_entity(inputs):
+    ds = inputs.itemById('direction')
+    return ds.selection(0).entity if ds.selectionCount else None
 
 
 def on_input_changed(app, inputs, changed_id):
@@ -351,8 +641,7 @@ def on_input_changed(app, inputs, changed_id):
 
 def on_validate(inputs):
     return (inputs.itemById('bodies').selectionCount > 0
-            and inputs.itemById('alpha').value > 0
-            and inputs.itemById('resolution').value > 0)
+            and inputs.itemById('planes').value >= 2)
 
 
 def on_preview(app, inputs, args):
@@ -360,59 +649,48 @@ def on_preview(app, inputs, args):
         clear_graphics(app)
         return
     o = read_options(inputs)
-    bodies = selected_bodies(inputs.itemById('bodies'))
     try:
-        res = compute(bodies, o)
-        text = describe(res, o)
+        fr, res = compute(selected(inputs.itemById('bodies')), _dir_entity(inputs), o)
+        text = describe(fr, res, o)
     except Exception:
         log(traceback.format_exc())
-        res, text = {}, 'Preview failed: %s' % short_error(traceback.format_exc())
-    # any write to an input wipes custom graphics: text first, mesh last
+        fr, res, text = None, {}, 'Preview failed: %s' % short_error(traceback.format_exc())
+    # any write to an input wipes custom graphics: text first, contours last
     info = inputs.itemById('info')
     if info.formattedText != text:
         info.formattedText = text
-    draw(app, res)
-
-
-def create_body(app, bodies, o, res):
-    des = adsk.fusion.Design.cast(app.activeProduct)
-    comp = des.rootComponent
-    base = comp.features.baseFeatures.add() if is_parametric(des) else None
-    if base:
-        base.startEdit()
-    try:
-        mb = comp.meshBodies.addByTriangleMeshData([v * MM for v in res['coords']],
-                                                   res['idx'], [], [])
-    finally:
-        if base:
-            base.finishEdit()
-    if base:
-        base.name = 'Alpha shape'
-        mbs = base.meshBodies               # a plain list, not a collection
-        mb = mbs[0] if mbs else mb
-    mb.name = 'Alpha shape a%.2f r%.2f mm' % (o['alpha_mm'], o['resolution_mm'])
-    if o.get('hide_inputs'):
-        for b in bodies:
-            try:
-                b.isLightBulbOn = False
-            except Exception:
-                pass
-    return mb
+    if fr:
+        draw(app, fr, res)
+    else:
+        clear_graphics(app)
 
 
 def on_execute(app, ui, inputs):
     o = read_options(inputs)
     save_settings(o)
-    bodies = selected_bodies(inputs.itemById('bodies'))
+    bodies = selected(inputs.itemById('bodies'))
     clear_graphics(app)
-    res = compute(bodies, o)
-    if not res.get('tris'):
-        ui.messageBox(describe(res, o).replace('<br>', '\n').replace('<b>', '')
-                      .replace('</b>', ''), CMD_NAME)
+    try:
+        fr, res = compute(bodies, _dir_entity(inputs), o)
+        if res.get('r_needed_mm'):
+            raise ValueError('With a closing radius of %.2f mm some planes fall apart into '
+                             'separate islands, so there is no single envelope to loft. '
+                             'Raise the closing radius to at least %.2f mm.'
+                             % (o['r_mm'], res['r_needed_mm']))
+        body = build_loft(app, fr, res, o)
+        if o.get('join', True):
+            join_objects(app, body, bodies)
+    except (ValueError, RuntimeError) as exc:
+        ui.messageBox(str(exc), CMD_NAME)
         return
-    mb = create_body(app, bodies, o, res)
-    state().report = ('Last: "%s"<br>' % mb.name) + describe(res, o)
-    log(json.dumps({k: v for k, v in res.items() if k not in ('coords', 'idx', 'normals')}))
+    if o['hide_inputs']:
+        for b in bodies:
+            try:
+                b.isLightBulbOn = False
+            except Exception:
+                pass
+    state().report = ('Last: "%s", %.1f mm3<br>' % (body.name, body.volume * 1000.0)
+                      + describe(fr, res, o))
 
 
 def on_destroy(app):
@@ -423,11 +701,11 @@ def on_destroy(app):
 # toolbar
 # --------------------------------------------------------------------------- #
 
-TOOLTIP = ('Wrap the selected bodies in their alpha shape, as a mesh body.\n\n'
-           'The surfaces are sampled every "Resolution" mm and every gap a ball of '
-           'radius "Alpha" cannot pass through is filled. Small alpha hugs each '
-           'object; large alpha tends to the convex hull. The preview follows the '
-           'values as you change them.')
+TOOLTIP = ('Wrap the selected bodies in a lofted solid.\n\n'
+           'Planes perpendicular to a direction (by default the mean axis of the '
+           'cylinders) cut every body; in each plane the cuts are joined, gaps '
+           'narrower than twice the closing radius are filled with round arcs, and '
+           'the outer contours become the sections of a loft.')
 
 
 def install(app, ui, created_handler_factory):
@@ -467,10 +745,12 @@ def _design(app):
 
 
 def _bodies_named(app, names):
-    out = []
     comp = _design(app).rootComponent
+    out = []
     for n in names:
-        b = comp.bRepBodies.itemByName(n) or comp.meshBodies.itemByName(n)
+        b = comp.bRepBodies.itemByName(n)
+        if b is None:                     # MeshBodies has no itemByName
+            b = next((m for m in comp.meshBodies if m.name == n), None)
         if b is None:
             raise ValueError('no body named %r' % n)
         out.append(b)
@@ -483,19 +763,25 @@ def dev_ping(app, job):
 
 
 def dev_run(app, job):
-    """Compute (and with create=True, build) the alpha shape of named bodies."""
+    """Sections (and with create=True, the loft) for named bodies."""
     o = dict(DEFAULTS)
     o.update(job.get('options') or {})
     bodies = _bodies_named(app, job['bodies'])
-    res = compute(bodies, o)
-    out = {k: v for k, v in res.items() if k not in ('coords', 'idx', 'normals')}
+    fr, res = compute(bodies, None, o)
+    out = {'direction': fr['d'], 'why': fr['why'], 'length_mm': fr['length_mm'],
+           'sections': len(res['sections']), 'points': res['points'],
+           'areas': [round(s['area_mm2'], 2) for s in res['sections']],
+           'warnings': res['warnings'], 'wall_s': res['wall_s']}
     if job.get('draw'):
-        draw(app, res)
-        out['drawn'] = True
-    if job.get('create') and res.get('tris'):
-        mb = create_body(app, bodies, o, res)
-        out['body'] = mb.name
-        out['body_tris'] = mb.mesh.triangleCount
+        draw(app, fr, res)
+    out['r_needed_mm'] = res.get('r_needed_mm')
+    out['bridged'] = res.get('bridged')
+    if job.get('create') and not res.get('r_needed_mm'):
+        body = build_loft(app, fr, res, o)
+        if o.get('join', True):
+            out['joined'] = join_objects(app, body, bodies)
+        out.update({'body': body.name, 'solid': body.isSolid, 'faces': body.faces.count,
+                    'volume_mm3': round(body.volume * 1000.0, 2)})
     return out
 
 
@@ -507,12 +793,21 @@ def dev_clear(app, job):
 def dev_snapshot(app, job):
     """Save the current view as it is - the camera is not touched."""
     vp = app.activeViewport
-    ok = vp.saveAsImageFile(job['path'], int(job.get('width', 1400)), int(job.get('height', 1000)))
+    if job.get('fit'):                    # only in a throwaway document
+        cam = vp.camera
+        cam.isSmoothTransition = False
+        cam.viewOrientation = adsk.core.ViewOrientations.IsoTopRightViewOrientation
+        cam.isFitView = True
+        vp.camera = cam
+        adsk.doEvents()
+        vp.refresh()
+    ok = vp.saveAsImageFile(job['path'], int(job.get('width', 1400)),
+                            int(job.get('height', 1000)))
     return {'saved': bool(ok), 'path': job['path']}
 
 
 def dev_make_test(app, job):
-    """A new document with three cylinders, so a build never touches the user's."""
+    """A new document with three pins, so a build never touches the user's."""
     doc = app.documents.add(adsk.core.DocumentTypes.FusionDesignDocumentType)
     des = _design(app)
     if not is_parametric(des):
@@ -521,9 +816,9 @@ def dev_make_test(app, job):
     tbm = adsk.fusion.TemporaryBRepManager.get()
     base = comp.features.baseFeatures.add()
     base.startEdit()
-    for k, (x, y) in enumerate(((0, 0), (0.8, 0.2), (0.3, 0.9))):
+    for x, y, tilt in job.get('pins', [(0, 0, 0), (0.8, 0.2, 0.15), (0.3, 0.9, -0.1)]):
         cyl = tbm.createCylinderOrCone(adsk.core.Point3D.create(x, y, 0), 0.12,
-                                       adsk.core.Point3D.create(x, y, 1.6), 0.12)
+                                       adsk.core.Point3D.create(x + tilt, y, 1.6), 0.12)
         comp.bRepBodies.add(cyl, base)
     base.finishEdit()
     names = []
@@ -540,11 +835,78 @@ def dev_close(app, job):
     return {'closed': name, 'now': app.activeDocument.name if app.activeDocument else None}
 
 
+def dev_activate(app, job):
+    for i in range(app.documents.count):
+        doc = app.documents.item(i)
+        if doc.name.startswith(job['name']):
+            doc.activate()
+            return {'active': app.activeDocument.name}
+    raise ValueError('no open document named %r' % job['name'])
+
+
+def dev_cylinders(app, job):
+    """Axis, radius, length and centre of each named body's cylindrical face."""
+    out = []
+    for b in _bodies_named(app, job['bodies']):
+        bb = adsk.fusion.BRepBody.cast(b)
+        row = {'name': b.name}
+        for f in bb.faces:
+            cy = adsk.core.Cylinder.cast(f.geometry)
+            if cy:
+                pts = body_points(bb)
+                a = _unit(_tup(cy.axis))
+                o = _tup(cy.origin)
+                hs = [_dot(_sub(p, o), a) for p in pts]
+                c = tuple(sum(p[k] for p in pts) / len(pts) * CM for k in range(3))
+                row.update({'axis': [round(v, 4) for v in a], 'diameter_mm': round(2 * cy.radius * CM, 3),
+                            'length_mm': round((max(hs) - min(hs)) * CM, 2),
+                            'centre_mm': [round(v, 1) for v in c]})
+        out.append(row)
+    return out
+
+
+def dev_clone(app, job):
+    """Copy named bodies of the active document into a NEW document (temp BRep
+    copies), so a build can be tried on real geometry without touching the user's."""
+    tbm = adsk.fusion.TemporaryBRepManager.get()
+    copies = [(b.name, tbm.copy(b)) for b in _bodies_named(app, job['bodies'])]
+    doc = app.documents.add(adsk.core.DocumentTypes.FusionDesignDocumentType)
+    des = _design(app)
+    if not is_parametric(des):
+        des.designType = adsk.fusion.DesignTypes.ParametricDesignType
+    comp = des.rootComponent
+    base = comp.features.baseFeatures.add()
+    base.startEdit()
+    for _n, c in copies:
+        comp.bRepBodies.add(c, base)
+    base.finishEdit()
+    names = []
+    for (n, _c), b in zip(copies, base.bodies):
+        b.name = n
+        names.append(b.name)
+    return {'doc': doc.name, 'bodies': names}
+
+
+def dev_extents(app, job):
+    """Each body's extent along the stack direction (mm from the stack origin)."""
+    bodies = _bodies_named(app, job['bodies'])
+    fr = setup(bodies, None, dict(DEFAULTS))
+    out = []
+    for b in bodies:
+        hs = [_dot(_sub(p, fr['origin']), fr['d']) * CM for p in body_points(b)]
+        out.append({'name': b.name, 'from': round(min(hs), 2), 'to': round(max(hs), 2)})
+    return {'d': fr['d'], 'bodies': out}
+
+
 DEV_COMMANDS = {
-    'make_test': dev_make_test,
-    'close': dev_close,
-    'snapshot': dev_snapshot,
+    'extents': dev_extents,
+    'clone': dev_clone,
+    'cylinders': dev_cylinders,
+    'activate': dev_activate,
     'ping': dev_ping,
     'run': dev_run,
     'clear': dev_clear,
+    'snapshot': dev_snapshot,
+    'make_test': dev_make_test,
+    'close': dev_close,
 }

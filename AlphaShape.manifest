@@ -4,7 +4,7 @@
     "id": "98bb9de3-85d7-43bc-9466-6d543af016cd",
     "author": "Iago Andreu",
     "description": {
-        "": "Wrap selected bodies in their alpha shape, with a live preview and a variable alpha and resolution."
+        "": "Wrap selected bodies in a lofted solid: closed section contours along a direction, with a live preview."
     },
     "version": "1.0.0",
     "runOnStartup": true,
