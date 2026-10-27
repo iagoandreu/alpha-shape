@@ -50,7 +50,7 @@ RANGES = [RANGE_SHARED, RANGE_ALL]
 
 DEFAULTS = {'r_mm': 3.0, 'planes': 12, 'bottom_mm': 0.0, 'top_mm': 0.0,
             'range': RANGE_SHARED, 'join': False,
-            'bridge': True, 'preview': True, 'hide_inputs': False}
+            'bridge': True, 'preview': False, 'hide_inputs': False}
 CONTOUR_COLOUR = (40, 140, 230)
 END_EPS_MM = 0.02          # a plane exactly on an end cap cuts a face, not a solid
 
@@ -610,7 +610,8 @@ def on_created(app, cmd):
                  'them, too far apart for the closing radius to join. On: that plane alone '
                  'gets the radius that joins it (the report lists them). Off: Create '
                  'refuses and says which radius would join every plane.')
-    inputs.addBoolValueInput('preview', 'Preview', True, '', bool(o['preview']))
+    # off at every opening, whatever was used last: a preview recomputes on every change
+    inputs.addBoolValueInput('preview', 'Preview', True, '', False)
     inputs.addBoolValueInput('hide_inputs', 'Hide the selected bodies afterwards', True, '',
                              bool(o['hide_inputs']))
     inputs.addTextBoxCommandInput('info', '', state().report or
