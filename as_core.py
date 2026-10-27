@@ -352,7 +352,7 @@ def setup(bodies, dir_entity, o):
     origin = tuple(sum(p[k] for p in pts) / n for k in range(3))
     # Where every object is cut, by default. Over the whole extent, objects that
     # end at different heights leave planes cutting only some of them, far
-    # apart: on the Dlab_155 margins the AK pins run 13-20 mm past the screw
+    # apart: on a distal radius case the pin margins run 13-20 mm past the screw
     # margins, those planes needed 36 mm bridges and the loft creased, or failed
     # outright with 32 planes. Over the shared range the bridges were 3.5-6 mm and
     # 12 and 24 planes gave the same volume within 0.5 %.

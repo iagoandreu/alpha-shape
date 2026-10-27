@@ -38,7 +38,7 @@ by a loft.
 ## Why "where every object is cut"
 
 Objects that end at different heights leave planes that cut only some of them,
-too far apart for the closing radius. On the Dlab_155 margins the three AK pins
+too far apart for the closing radius. On the margins of a distal radius case the three pins
 (Ø 4 × 53 mm) run 13–20 mm past the screw margins (Ø 7.2 × 24–26 mm): over the
 whole extent those planes needed 36 mm of bridging, the loft creased, and with 32
 planes it failed outright. Over the 22.6 mm every margin crosses, the bridges
@@ -59,7 +59,7 @@ dropped; the loft cannot use slivers.
 |---|---|
 | two Ø 2.4 circles 6 mm apart | apart at r = 1; joined with a waist at r = 4; at r = 100, the hull less the waist's sag (0.36 mm²) |
 | three test pins, one tilted 1.5° | solid of 3 faces after aligning the matching points (before: a crease where the start point jumped) |
-| 12 Dlab_155 margins, shared range, 16 planes | one joined solid, 11 232 mm³; sections in 0.65 s |
+| 12 margins of a distal radius case, shared range, 16 planes | one joined solid, 11 232 mm³; sections in 0.65 s |
 
 ## Fusion traps found here
 

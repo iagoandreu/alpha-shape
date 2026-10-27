@@ -128,7 +128,7 @@ def main():
         # Closing joins two objects of radius a, centres D apart, only when
         # D/2 <= sqrt(a^2 + 2 a r): for thin pins that takes far more than half
         # the gap. Objects that end at different heights leave planes that cut
-        # only some of them, far apart - on the Dlab_155 margins a global radius
+        # only some of them, far apart - on a distal radius case a global radius
         # of 31-41 mm would have been needed. Lofting through whichever island is
         # largest changes object from plane to plane and the loft jumps.
         def r_single(lps, start):
